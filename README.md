@@ -40,7 +40,7 @@ curl -fsSL https://raw.githubusercontent.com/marcos-toliveira/opencode-quota-met
 | `quota-meter --line` | resumo em uma linha |
 | `quota-meter --details` | tabela com $ usado/teto por janela |
 | `quota-meter --json` | JSON (scriptável; `--indent` formata) |
-| `quota-meter --tui` | interface interativa (`q` sair · `r` atualizar · `a` ajuste de pico) |
+| `quota-meter --tui` | interface interativa com a **tabela completa** ($ usado/teto por janela; `q` sair · `r` atualizar · `a` ajuste de pico). Adaptativa: ≥118 colunas mostra teto e valores completos; telas estreitas mostram versão resumida |
 | `quota-meter --watch 60` | repete o modo texto a cada 60s |
 
 Opções: `--flat` (não ajusta pico) · `--bar N` · `--no-color` · `--db PATH` · `--config PATH` · `--version`.

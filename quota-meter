@@ -283,46 +283,74 @@ def run_tui(db, limits, peak_doubled, short):
                      f"· pico {'OFF' if state['flat'] else 'ON'} ")
             try:
                 stdscr.addstr(0, 0, title[: w - 1], curses.A_REVERSE)
-                stdscr.addstr(2, 1, f"{'Modelo':<15} {'5h':<10} {'7d':<10} {'30d':<10} {'Reqs':>6}  Status"[: w - 2], curses.A_BOLD)
             except curses.error:
                 pass
-            r, width = 3, (8 if w > 92 else 5)
+
+            mode = "full" if w >= 118 else ("mid" if w >= 94 else "tiny")
+            cellw = {"full": 20, "mid": 14, "tiny": 6}[mode]
+            namew = 15 if mode != "tiny" else 13
+
+            def usage_cell(m, idx):
+                pct = m["pct"][idx]
+                pair = 1 if pct < 70 else (2 if pct < 90 else 3)
+                if mode == "full":
+                    txt = f"{usd(m['used'][idx])}/{usd(m['caps'][idx])} {pct:>3.0f}%"
+                elif mode == "mid":
+                    txt = f"{usd(m['used'][idx])} {pct:>3.0f}%"
+                else:
+                    txt = f"{pct:>3.0f}%"
+                return txt.ljust(cellw), pair
+
+            head = f"{'Modelo':<{namew}}"
+            if mode == "full":
+                head += f"{'Lim':>7}"
+            head += "  " + "  ".join(f"{wd:<{cellw}}" for wd, _, _ in WINDOWS)
+            head += f" {'Reqs':>6}  Status"
+            try:
+                stdscr.addstr(2, 1, head[: w - 2], curses.A_BOLD)
+            except curses.error:
+                pass
+
+            r = 3
             for m in models:
                 if r >= h - 3:
                     break
-                if not m["limit"]:
-                    try:
-                        stdscr.addstr(r, 1, f"{m['name']:<15} ilimitado ({m['reqs'][2]} reqs)"[: w - 2])
-                    except curses.error:
-                        pass
-                    r += 1
-                    continue
                 try:
-                    stdscr.addstr(r, 1, f"{m['name']:<15} "[:16])
+                    x = 1
+                    stdscr.addstr(r, x, f"{m['name']:<{namew}}"[:namew])
+                    x += namew
+                    if mode == "full":
+                        lim = usd(m["limit"]) if m["limit"] else "∞"
+                        stdscr.addstr(r, x, f"{lim:>7}")
+                        x += 7
+                    x += 2
+                    if m["limit"]:
+                        for idx in range(3):
+                            txt, pair = usage_cell(m, idx)
+                            if x + cellw <= w - 2:
+                                stdscr.addstr(r, x, txt, curses.color_pair(pair))
+                            x += cellw + 2
+                    else:
+                        txt = f"ilimitado ({m['reqs'][2]} reqs) "
+                        if x + len(txt) < w - 2:
+                            stdscr.addstr(r, x, txt[: w - x - 2])
+                        x += len(txt)
+                    tail = f"{m['reqs'][2]:>6}  {m['status']}{flag(m)}"
+                    if x + len(tail) <= w - 2:
+                        if m["status"] in ("ok", "livre"):
+                            attr = curses.color_pair(1)
+                        else:
+                            pair = 2 if m["status"] == "atencao" else 3
+                            attr = curses.color_pair(pair) | curses.A_BOLD
+                        stdscr.addstr(r, x, tail, attr)
                 except curses.error:
                     pass
-                x = 17
-                for idx in range(3):
-                    pct = m["pct"][idx]
-                    filled = int(round(min(max(pct, 0), 100) / 100 * width))
-                    b = "█" * filled + "░" * (width - filled)
-                    pair = 1 if pct < 70 else (2 if pct < 90 else 3)
-                    if x + width + 8 < w:
-                        try:
-                            stdscr.addstr(r, x, b, curses.color_pair(pair))
-                            stdscr.addstr(r, x + width, f" {pct:>4.0f}% ")
-                        except curses.error:
-                            pass
-                    x += width + 7
-                tail = f"{m['reqs'][2]:>6}  {m['status']}{flag(m)}"
-                if x + len(tail) < w:
-                    try:
-                        stdscr.addstr(r, x, tail)
-                    except curses.error:
-                        pass
                 r += 1
             if r == 3:
-                stdscr.addstr(3, 1, "Sem uso registrado nos últimos 30 dias.")
+                try:
+                    stdscr.addstr(3, 1, "Sem uso registrado nos últimos 30 dias.")
+                except curses.error:
+                    pass
             try:
                 stdscr.addstr(h - 1, 0, " q sair · r atualizar · a ajuste de pico · auto 60s "[: w - 1], curses.A_DIM)
             except curses.error:
