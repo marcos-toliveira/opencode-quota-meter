@@ -1,0 +1,12 @@
+{
+  "limits": {
+    "deepseek-v4.1-flash": 60,
+    "mimo-v2.6-flash": 60,
+    "glm-5.3-flash": 60
+  },
+  "peak_doubled": ["deepseek-v4.1-flash", "deepseek-v4-flash", "deepseek-v4-flash-vision-exp", "deepseek-v4-pro"],
+  "short_names": {
+    "deepseek-v4.1-flash": "DeepSeek 4.1F",
+    "mimo-v2.6-flash": "MiMo 2.6F"
+  }
+}

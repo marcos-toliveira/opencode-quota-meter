@@ -1,0 +1,408 @@
+#!/usr/bin/env python3
+# quota-meter — medidor de cotas do OpenCode Go por modelo (janelas rolantes 5h/7d/30d).
+# Licença: MIT · https://github.com/marcos-toliveira/opencode-quota-meter
+#
+# Lê o banco local do OpenCode (somente-leitura), resolve o caminho do banco
+# automaticamente (`opencode debug paths db`) e ajusta o custo 2x para modelos
+# DeepSeek em horário de pico (seg-sex, 01-04h e 06-10h UTC).
+#
+# Modos: (default) resumo compacto · --line · --details · --json · --tui · --watch N
+# Requisitos: Python 3.8+ · OpenCode v2 (para os dados) · curses p/ TUI
+#             (Windows: pip install windows-curses).
+"""quota-meter — medidor de cotas do OpenCode Go."""
+
+__version__ = "1.0.0"
+
+import argparse
+import datetime as dt
+import json
+import os
+import shutil
+import sqlite3
+import subprocess
+import sys
+import time
+
+CONFIG_DEFAULT = os.path.expanduser("~/.config/quota-meter.json")
+
+LIMITS = {
+    "deepseek-v4.1-flash": 60, "deepseek-v4-flash": 30,
+    "deepseek-v4-flash-vision-exp": 15, "deepseek-v4-pro": 15,
+    "mimo-v2.6-flash": 60, "mimo-v2.5": 60, "mimo-v2.6-pro": 15, "mimo-v2.5-pro": 15,
+    "glm-5.3-flash": 60, "glm-5.3": 15, "glm-5.2": 60,
+    "minimax-m3": 60, "minimax-m2.7": 60,
+    "qwen3.7-plus": 60, "qwen3.8-flash": 30, "qwen3.8-max": 15,
+    "kimi-k2.7-code": 60, "kimi-k2.6": 60, "kimi-k3": 15,
+    "gpt-6-luna": 15, "gpt-5.6-luna": 15, "grok-4.7": 15, "grok-4.6": 15,
+    "muse-spark-1.3-contributor": 60, "muse-spark-1.2-contributor": 60,
+    "longcat-2.0": 60, "hy3": 60, "hy4-preview": 30,
+    "space-bunny-free": None, "longcat-2.5-preview-free": None,
+}
+SHORT = {
+    "deepseek-v4.1-flash": "DeepSeek 4.1F", "deepseek-v4-flash": "DeepSeek 4F",
+    "deepseek-v4-flash-vision-exp": "DS 4F Vision", "deepseek-v4-pro": "DeepSeek 4 Pro",
+    "mimo-v2.6-flash": "MiMo 2.6F", "mimo-v2.5": "MiMo 2.5",
+    "glm-5.3-flash": "GLM 5.3F", "glm-5.3": "GLM 5.3", "glm-5.2": "GLM 5.2",
+    "minimax-m3": "MiniMax M3", "minimax-m2.7": "MiniMax 2.7",
+    "qwen3.7-plus": "Qwen 3.7+", "qwen3.8-flash": "Qwen 3.8F", "qwen3.8-max": "Qwen 3.8 Max",
+    "kimi-k2.7-code": "Kimi 2.7C", "kimi-k2.6": "Kimi 2.6", "kimi-k3": "Kimi K3",
+    "gpt-6-luna": "GPT-6 Luna", "gpt-5.6-luna": "GPT-5.6 Luna",
+    "grok-4.7": "Grok 4.7", "grok-4.6": "Grok 4.6",
+    "muse-spark-1.3-contributor": "Muse 1.3C", "muse-spark-1.2-contributor": "Muse 1.2C",
+    "longcat-2.0": "LongCat 2.0", "hy3": "Hy3", "hy4-preview": "Hy4 prev",
+    "space-bunny-free": "Space Bunny", "longcat-2.5-preview-free": "LongCat Free",
+}
+PEAK_DOUBLED = {"deepseek-v4.1-flash", "deepseek-v4-flash",
+                "deepseek-v4-flash-vision-exp", "deepseek-v4-pro"}
+WINDOWS = (("5h", 5 * 3600_000, 0.20), ("7d", 7 * 86400_000, 0.50), ("30d", 30 * 86400_000, 1.00))
+GREEN, YELLOW, RED, CYAN, RESET = "\x1b[32m", "\x1b[33m", "\x1b[31;1m", "\x1b[36m", "\x1b[0m"
+
+
+def fail(msg):
+    print(f"quota-meter: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def resolve_db(explicit=None):
+    """--db > QUOTA_METER_DB > `opencode debug paths db` > fallback XDG/Windows."""
+    if explicit:
+        return os.path.expanduser(explicit)
+    env = os.environ.get("QUOTA_METER_DB")
+    if env:
+        return os.path.expanduser(env)
+    exe = shutil.which("opencode")
+    if exe:
+        try:
+            out = subprocess.run([exe, "debug", "paths", "db"],
+                                 capture_output=True, text=True, timeout=15)
+            for line in reversed((out.stdout or "").strip().splitlines()):
+                p = line.strip()
+                if p and os.path.isabs(p) and os.path.exists(p):
+                    return p
+        except Exception:
+            pass
+    home = os.path.expanduser("~")
+    candidates = [
+        os.path.join(os.environ.get("XDG_DATA_HOME", os.path.join(home, ".local", "share")),
+                     "opencode", "opencode.db"),
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "opencode", "opencode.db"),
+        os.path.join(os.environ.get("APPDATA", ""), "opencode", "opencode.db"),
+    ]
+    for c in candidates:
+        if c and os.path.exists(c):
+            return c
+    return candidates[0]
+
+
+def load_config(path):
+    cfg = {}
+    if path and os.path.exists(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                cfg = json.load(f)
+        except Exception as e:
+            print(f"quota-meter: aviso: config inválido em {path}: {e}", file=sys.stderr)
+    return cfg
+
+
+def is_peak(ms):
+    u = dt.datetime.fromtimestamp(ms / 1000, tz=dt.timezone.utc)
+    return u.weekday() < 5 and ((1 <= u.hour < 4) or (6 <= u.hour < 10))
+
+
+def open_db(db):
+    if not os.path.exists(db):
+        fail(f"banco do OpenCode não encontrado em {db}\n"
+             "  → instale/use o OpenCode v2, ou aponte com --db / QUOTA_METER_DB.")
+    try:
+        con = sqlite3.connect("file:" + db + "?mode=ro", uri=True)
+        tables = {r[0] for r in con.execute("select name from sqlite_master where type='table'")}
+    except sqlite3.Error as e:
+        fail(f"não consegui abrir o banco {db}: {e}")
+    if "session_message" not in tables:
+        fail(f"schema do OpenCode v2 não encontrado em {db} "
+             "(tabela session_message ausente). Versão incompatível?")
+    return con
+
+
+def load(db, limits, peak_doubled, short, flat=False):
+    now_ms = int(time.time() * 1000)
+    agg = {}
+    con = open_db(db)
+    for (tc, data) in con.execute(
+        "select time_created, data from session_message "
+        "where type='assistant' and time_created >= ?",
+        (now_ms - WINDOWS[-1][1],),
+    ):
+        try:
+            d = json.loads(data)
+        except Exception:
+            continue
+        mid = (d.get("model") or {}).get("id")
+        if not mid:
+            continue
+        ts = (d.get("time") or {}).get("created") or tc
+        cost = d.get("cost") or 0.0
+        if not flat and mid in peak_doubled and is_peak(ts):
+            cost *= 2
+        a = agg.setdefault(mid, {"w": [0.0, 0.0, 0.0], "n": [0, 0, 0]})
+        for i, (_, span, _) in enumerate(WINDOWS):
+            if now_ms - ts <= span:
+                a["w"][i] += cost
+                a["n"][i] += 1
+
+    models = []
+    for mid, a in agg.items():
+        limit = limits.get(mid)
+        caps = [limit * f for (_, _, f) in WINDOWS] if limit else [None] * 3
+        pcts = [(a["w"][i] / caps[i] * 100 if caps[i] else 0.0) for i in range(3)]
+        worst = max(pcts) if limit else 0.0
+        if limit is None:
+            status = "livre"
+        elif worst >= 100:
+            status = "estourado"
+        elif worst >= 90:
+            status = "critico"
+        elif worst >= 70:
+            status = "atencao"
+        else:
+            status = "ok"
+        models.append({
+            "id": mid, "name": short.get(mid, mid[:14]), "limit": limit,
+            "used": a["w"], "caps": caps, "pct": pcts, "reqs": a["n"],
+            "worst": worst, "status": status,
+        })
+    models.sort(key=lambda m: -m["worst"])
+    return models, now_ms
+
+
+def usd(x):
+    return f"${x:,.2f}" if abs(x) >= 1 else f"${x:.3f}"
+
+
+def color_for(pct):
+    return GREEN if pct < 70 else (YELLOW if pct < 90 else RED)
+
+
+def bar(pct, width=8, use_color=True):
+    filled = int(round(min(max(pct, 0), 100) / 100 * width))
+    s = "█" * filled + "░" * (width - filled)
+    return f"{color_for(pct)}{s}{RESET}" if use_color else s
+
+
+def flag(m):
+    return {"estourado": " ⚠", "critico": " ⚠", "atencao": " ~"}.get(m["status"], "")
+
+
+def fmt_pretty(models, now_ms, size=8, use_color=True):
+    if not models:
+        return "OC Go: sem uso nos últimos 30 dias"
+    hh = dt.datetime.fromtimestamp(now_ms / 1000)
+    head = f"OC Go · {hh:%d/%m %H:%M}"
+    lines = [f"{CYAN}{head}{RESET}" if use_color else head]
+    for m in models[:6]:
+        if m["limit"]:
+            cells = "  ".join(
+                f"{w} {bar(m['pct'][i], size, use_color)} {m['pct'][i]:>4.0f}%"
+                for i, (w, _, _) in enumerate(WINDOWS)
+            )
+        else:
+            cells = "ilimitado"
+        lines.append(f"{m['name']:<13} {cells}{flag(m)}")
+    return "\n".join(lines)
+
+
+def fmt_line(models):
+    if not models:
+        return "OC Go: sem uso"
+    top = max(models, key=lambda m: m["pct"][1])
+    return (f"OC Go ⟫ 5h máx {max(m['pct'][0] for m in models):.0f}% · "
+            f"7d máx {top['pct'][1]:.0f}% ({top['name']}){flag(top)} · "
+            f"30d máx {max(m['pct'][2] for m in models):.0f}%")
+
+
+def fmt_details(models, now_ms):
+    hh = dt.datetime.fromtimestamp(now_ms / 1000)
+    out = [f"OpenCode Go — quotas por modelo (5h/7d/30d) · {hh:%d/%m/%Y %H:%M}"]
+    out.append(f"{'Modelo':<16}{'Lim':>6}  {'5h':>19}  {'7d':>19}  {'30d':>19}  {'Reqs':>6}  Status")
+    for m in models:
+        if not m["limit"]:
+            out.append(f"{m['name']:<16}{'∞':>6}  {'—':>19}  {'—':>19}  {'—':>19}  {m['reqs'][2]:>6}  livre")
+            continue
+        cells = [f"{usd(m['used'][i])}/{usd(m['caps'][i])} {m['pct'][i]:>3.0f}%" for i in range(3)]
+        out.append(
+            f"{m['name']:<16}{usd(m['limit']):>6}  {cells[0]:>19}  {cells[1]:>19}  {cells[2]:>19}  {m['reqs'][2]:>6}  {m['status']}"
+        )
+    return "\n".join(out)
+
+
+def fmt_json(models, now_ms, flat, indent=None):
+    return json.dumps({
+        "generated_at": dt.datetime.fromtimestamp(now_ms / 1000).isoformat(timespec="seconds"),
+        "peak_adjusted": not flat,
+        "models": [
+            {
+                "id": m["id"], "name": m["name"], "limit_usd": m["limit"],
+                "windows": {
+                    w: {"used_usd": round(m["used"][i], 4), "cap_usd": m["caps"][i],
+                        "pct": round(m["pct"][i], 1), "requests": m["reqs"][i]}
+                    for i, (w, _, _) in enumerate(WINDOWS)
+                },
+                "status": m["status"],
+            } for m in models
+        ],
+    }, ensure_ascii=False, indent=indent)
+
+
+def run_tui(db, limits, peak_doubled, short):
+    try:
+        import curses
+    except ImportError:
+        fail("TUI requer o módulo curses (no Windows: pip install windows-curses).\n"
+             "  → use --line / --details / --json, ou rode no WSL.")
+
+    def main(stdscr):
+        curses.curs_set(0)
+        stdscr.timeout(1000)
+        try:
+            curses.start_color()
+            curses.use_default_colors()
+            curses.init_pair(1, curses.COLOR_GREEN, -1)
+            curses.init_pair(2, curses.COLOR_YELLOW, -1)
+            curses.init_pair(3, curses.COLOR_RED, -1)
+        except curses.error:
+            pass
+        state = {"flat": False, "last": 0.0}
+
+        def draw():
+            stdscr.erase()
+            h, w = stdscr.getmaxyx()
+            models, now_ms = load(db, limits, peak_doubled, short, flat=state["flat"])
+            hh = dt.datetime.fromtimestamp(now_ms / 1000)
+            title = (f" quota-meter {__version__} — OpenCode Go · {hh:%d/%m %H:%M:%S} "
+                     f"· pico {'OFF' if state['flat'] else 'ON'} ")
+            try:
+                stdscr.addstr(0, 0, title[: w - 1], curses.A_REVERSE)
+                stdscr.addstr(2, 1, f"{'Modelo':<15} {'5h':<10} {'7d':<10} {'30d':<10} {'Reqs':>6}  Status"[: w - 2], curses.A_BOLD)
+            except curses.error:
+                pass
+            r, width = 3, (8 if w > 92 else 5)
+            for m in models:
+                if r >= h - 3:
+                    break
+                if not m["limit"]:
+                    try:
+                        stdscr.addstr(r, 1, f"{m['name']:<15} ilimitado ({m['reqs'][2]} reqs)"[: w - 2])
+                    except curses.error:
+                        pass
+                    r += 1
+                    continue
+                try:
+                    stdscr.addstr(r, 1, f"{m['name']:<15} "[:16])
+                except curses.error:
+                    pass
+                x = 17
+                for idx in range(3):
+                    pct = m["pct"][idx]
+                    filled = int(round(min(max(pct, 0), 100) / 100 * width))
+                    b = "█" * filled + "░" * (width - filled)
+                    pair = 1 if pct < 70 else (2 if pct < 90 else 3)
+                    if x + width + 8 < w:
+                        try:
+                            stdscr.addstr(r, x, b, curses.color_pair(pair))
+                            stdscr.addstr(r, x + width, f" {pct:>4.0f}% ")
+                        except curses.error:
+                            pass
+                    x += width + 7
+                tail = f"{m['reqs'][2]:>6}  {m['status']}{flag(m)}"
+                if x + len(tail) < w:
+                    try:
+                        stdscr.addstr(r, x, tail)
+                    except curses.error:
+                        pass
+                r += 1
+            if r == 3:
+                stdscr.addstr(3, 1, "Sem uso registrado nos últimos 30 dias.")
+            try:
+                stdscr.addstr(h - 1, 0, " q sair · r atualizar · a ajuste de pico · auto 60s "[: w - 1], curses.A_DIM)
+            except curses.error:
+                pass
+            stdscr.refresh()
+
+        while True:
+            now = time.time()
+            if now - state["last"] >= 60:
+                draw()
+                state["last"] = now
+            ch = stdscr.getch()
+            if ch == ord("q"):
+                break
+            if ch in (ord("r"), curses.KEY_RESIZE):
+                draw()
+                state["last"] = time.time()
+            elif ch == ord("a"):
+                state["flat"] = not state["flat"]
+                draw()
+                state["last"] = time.time()
+
+    curses.wrapper(main)
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="quota-meter",
+        description="Medidor de cotas do OpenCode Go por modelo (janelas rolantes 5h/7d/30d).",
+    )
+    ap.add_argument("--line", action="store_true", help="resumo em uma linha")
+    ap.add_argument("--details", action="store_true", help="tabela completa")
+    ap.add_argument("--json", action="store_true", help="saída JSON")
+    ap.add_argument("--tui", action="store_true", help="interface interativa (curses)")
+    ap.add_argument("--watch", type=int, default=0, metavar="N", help="repete a cada N segundos")
+    ap.add_argument("--flat", action="store_true", help="não ajusta custo de pico")
+    ap.add_argument("--bar", type=int, default=8, help="largura das barras (default 8)")
+    ap.add_argument("--no-color", action="store_true", help="sem cores ANSI")
+    ap.add_argument("--indent", type=int, default=None, help="indentação do JSON")
+    ap.add_argument("--db", default=None, help="caminho do opencode.db")
+    ap.add_argument("--config", default=CONFIG_DEFAULT, help="arquivo de configuração JSON")
+    ap.add_argument("-V", "--version", action="version", version=f"quota-meter {__version__}")
+    args = ap.parse_args()
+
+    db = resolve_db(args.db)
+    cfg = load_config(args.config)
+    limits = dict(LIMITS)
+    limits.update(cfg.get("limits") or {})
+    short = dict(SHORT)
+    short.update(cfg.get("short_names") or {})
+    peak_doubled = set(cfg.get("peak_doubled") or PEAK_DOUBLED)
+
+    if args.tui:
+        run_tui(db, limits, peak_doubled, short)
+        return
+
+    use_color = (sys.stdout.isatty() and not args.no_color
+                 and "NO_COLOR" not in os.environ)
+
+    def render():
+        models, now_ms = load(db, limits, peak_doubled, short, flat=args.flat)
+        if args.json:
+            return fmt_json(models, now_ms, args.flat, args.indent)
+        if args.line:
+            return fmt_line(models)
+        if args.details:
+            return fmt_details(models, now_ms)
+        return fmt_pretty(models, now_ms, args.bar, use_color)
+
+    if args.watch > 0:
+        try:
+            while True:
+                print(render())
+                sys.stdout.flush()
+                time.sleep(args.watch)
+        except KeyboardInterrupt:
+            pass
+    else:
+        print(render())
+
+
+if __name__ == "__main__":
+    main()
