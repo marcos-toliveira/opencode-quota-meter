@@ -26,4 +26,7 @@ else
   echo "   ok"
 fi
 
+echo "7) --tclock (sem rede)"
+python3 "$BIN" --tclock --no-official | grep -q "Modelo" && echo "   ok"
+
 echo "smoke ok"

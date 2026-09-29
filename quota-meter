@@ -11,7 +11,7 @@
 #             (Windows: pip install windows-curses).
 """quota-meter — medidor de cotas do OpenCode Go."""
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 import argparse
 import datetime as dt
@@ -108,6 +108,55 @@ def load_config(path):
 def is_peak(ms):
     u = dt.datetime.fromtimestamp(ms / 1000, tz=dt.timezone.utc)
     return u.weekday() < 5 and ((1 <= u.hour < 4) or (6 <= u.hour < 10))
+
+
+def rel_reset(iso):
+    """Tempo relativo até um reset (ex.: '1h 03m')."""
+    if not iso:
+        return ""
+    try:
+        t = dt.datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        secs = (t - dt.datetime.now(dt.timezone.utc)).total_seconds()
+    except Exception:
+        return ""
+    if secs <= 0:
+        return "agora"
+    d, rem = divmod(int(secs), 86400)
+    h, rem = divmod(rem, 3600)
+    m = rem // 60
+    if d:
+        return f"{d}d {h:02d}h"
+    if h:
+        return f"{h}h {m:02d}m"
+    return f"{m}m"
+
+
+def official_usage(timeout=8):
+    """Métricas oficiais do OpenCode Go via ai-usagebar (se instalado). None se indisponível."""
+    exe = shutil.which("ai-usagebar")
+    if not exe:
+        return None
+    try:
+        out = subprocess.run([exe, "usage", "--json"], capture_output=True, text=True, timeout=timeout)
+        doc = json.loads(out.stdout or "{}")
+    except Exception:
+        return None
+    for e in doc.get("entries") or []:
+        if e.get("brand") != "opencode-go" or e.get("status") != "ready" or e.get("error"):
+            continue
+        metrics = {}
+        for m in e.get("metrics") or []:
+            label = (m.get("label") or "").lower()
+            key = "5h" if ("rolling" in label or "5h" in label) else (
+                "7d" if ("weekly" in label or "7d" in label) else (
+                    "30d" if "monthly" in label else None))
+            if key:
+                metrics[key] = {"pct": m.get("percent"), "reset_at": m.get("reset_at"),
+                                "severity": m.get("severity")}
+        if metrics:
+            metrics["fetched_at"] = e.get("fetched_at")
+            return metrics
+    return None
 
 
 def open_db(db):
@@ -221,9 +270,51 @@ def fmt_line(models):
             f"30d máx {max(m['pct'][2] for m in models):.0f}%")
 
 
-def fmt_details(models, now_ms):
+def fmt_tclock(models, official=None, use_color=True):
+    """Tabela numérica compacta para o widget do tclock (%, por janela/modelo)."""
+    lines = []
+    if official:
+        parts = []
+        for w in ("5h", "7d", "30d"):
+            o = official.get(w) or {}
+            if o.get("pct") is not None:
+                c = color_for(o["pct"]) if use_color else ""
+                rst = RESET if use_color else ""
+                parts.append(f"{w} {c}{o['pct']:>3.0f}%{rst}")
+        if parts:
+            lines.append("Oficial  " + " · ".join(parts))
+    if models:
+        lines.append("Modelo" + "".join(f"{w:>7}" for w in ("5h", "7d", "30d")))
+        for m in models[:6]:
+            if not m["limit"]:
+                lines.append(f"{m['name']:<14} ilimitado")
+                continue
+            cells = []
+            for i in range(3):
+                pct = m["pct"][i]
+                fl = "⚠" if pct >= 90 else ("~" if pct >= 70 else "")
+                pad = f"{pct:>4.0f}%{fl}".ljust(7)
+                if use_color:
+                    pad = f"{color_for(pct)}{pad}{RESET}"
+                cells.append(pad)
+            lines.append(f"{m['name']:<14}" + "".join(cells).rstrip())
+    if not lines:
+        lines.append("OC Go: sem uso nos últimos 30 dias")
+    return "\n".join(lines)
+
+
+def fmt_details(models, now_ms, official=None):
     hh = dt.datetime.fromtimestamp(now_ms / 1000)
     out = [f"OpenCode Go — quotas por modelo (5h/7d/30d) · {hh:%d/%m/%Y %H:%M}"]
+    if official:
+        parts = []
+        for w in ("5h", "7d", "30d"):
+            o = official.get(w) or {}
+            if o.get("pct") is not None:
+                r = rel_reset(o.get("reset_at"))
+                parts.append(f"{w} {o['pct']:.0f}%" + (f" (reseta {r})" if r else ""))
+        if parts:
+            out.append("Oficial (ai-usagebar): " + " · ".join(parts))
     out.append(f"{'Modelo':<16}{'Lim':>6}  {'5h':>19}  {'7d':>19}  {'30d':>19}  {'Reqs':>6}  Status")
     for m in models:
         if not m["limit"]:
@@ -236,10 +327,11 @@ def fmt_details(models, now_ms):
     return "\n".join(out)
 
 
-def fmt_json(models, now_ms, flat, indent=None):
+def fmt_json(models, now_ms, flat, official=None, indent=None):
     return json.dumps({
         "generated_at": dt.datetime.fromtimestamp(now_ms / 1000).isoformat(timespec="seconds"),
         "peak_adjusted": not flat,
+        "official": official,
         "models": [
             {
                 "id": m["id"], "name": m["name"], "limit_usd": m["limit"],
@@ -254,7 +346,7 @@ def fmt_json(models, now_ms, flat, indent=None):
     }, ensure_ascii=False, indent=indent)
 
 
-def run_tui(db, limits, peak_doubled, short):
+def run_tui(db, limits, peak_doubled, short, official_enabled=True):
     try:
         import curses
     except ImportError:
@@ -272,7 +364,7 @@ def run_tui(db, limits, peak_doubled, short):
             curses.init_pair(3, curses.COLOR_RED, -1)
         except curses.error:
             pass
-        state = {"flat": False, "last": 0.0}
+        state = {"flat": False, "last": 0.0, "official": None, "official_last": 0.0}
 
         def draw():
             stdscr.erase()
@@ -285,6 +377,18 @@ def run_tui(db, limits, peak_doubled, short):
                 stdscr.addstr(0, 0, title[: w - 1], curses.A_REVERSE)
             except curses.error:
                 pass
+            if state.get("official"):
+                o = state["official"]
+                parts = []
+                for wd in ("5h", "7d", "30d"):
+                    oo = o.get(wd) or {}
+                    if oo.get("pct") is not None:
+                        r = rel_reset(oo.get("reset_at"))
+                        parts.append(f"{wd} {oo['pct']:.0f}%" + (f" r:{r}" if r else ""))
+                try:
+                    stdscr.addstr(1, 1, ("Oficial (ai-usagebar): " + " · ".join(parts))[: w - 2])
+                except curses.error:
+                    pass
 
             mode = "full" if w >= 118 else ("mid" if w >= 94 else "tiny")
             cellw = {"full": 20, "mid": 14, "tiny": 6}[mode]
@@ -359,6 +463,9 @@ def run_tui(db, limits, peak_doubled, short):
 
         while True:
             now = time.time()
+            if official_enabled and now - state["official_last"] >= 300:
+                state["official"] = official_usage()
+                state["official_last"] = now
             if now - state["last"] >= 60:
                 draw()
                 state["last"] = now
@@ -392,6 +499,9 @@ def main():
     ap.add_argument("--indent", type=int, default=None, help="indentação do JSON")
     ap.add_argument("--db", default=None, help="caminho do opencode.db")
     ap.add_argument("--config", default=CONFIG_DEFAULT, help="arquivo de configuração JSON")
+    ap.add_argument("--tclock", action="store_true", help="formato compacto p/ widget do tclock (inclui oficiais)")
+    ap.add_argument("--official", action="store_true", help="força leitura das métricas oficiais (ai-usagebar)")
+    ap.add_argument("--no-official", action="store_true", help="não consultar o ai-usagebar")
     ap.add_argument("-V", "--version", action="version", version=f"quota-meter {__version__}")
     args = ap.parse_args()
 
@@ -404,20 +514,24 @@ def main():
     peak_doubled = set(cfg.get("peak_doubled") or PEAK_DOUBLED)
 
     if args.tui:
-        run_tui(db, limits, peak_doubled, short)
+        run_tui(db, limits, peak_doubled, short, official_enabled=use_official)
         return
 
-    use_color = (sys.stdout.isatty() and not args.no_color
-                 and "NO_COLOR" not in os.environ)
+    use_official = (not args.no_official) and (args.official or args.tclock or args.details or args.tui)
+    use_color = ((not args.no_color) and "NO_COLOR" not in os.environ
+                 and (sys.stdout.isatty() or "TCLOCK_WIDGET_THEME" in os.environ))
 
     def render():
+        official = official_usage() if use_official else None
         models, now_ms = load(db, limits, peak_doubled, short, flat=args.flat)
+        if args.tclock:
+            return fmt_tclock(models, official, use_color)
         if args.json:
-            return fmt_json(models, now_ms, args.flat, args.indent)
+            return fmt_json(models, now_ms, args.flat, official, args.indent)
         if args.line:
             return fmt_line(models)
         if args.details:
-            return fmt_details(models, now_ms)
+            return fmt_details(models, now_ms, official)
         return fmt_pretty(models, now_ms, args.bar, use_color)
 
     if args.watch > 0:

@@ -38,6 +38,7 @@ curl -fsSL https://raw.githubusercontent.com/marcos-toliveira/opencode-quota-met
 |---|---|
 | `quota-meter` | resumo compacto multi-linha — ideal p/ widget do tclock |
 | `quota-meter --line` | resumo em uma linha |
+| `quota-meter --tclock` | tabela numérica compacta para widget do tclock (%, por modelo) + linha oficial do ai-usagebar quando disponível |
 | `quota-meter --details` | tabela com $ usado/teto por janela |
 | `quota-meter --json` | JSON (scriptável; `--indent` formata) |
 | `quota-meter --tui` | interface interativa com a **tabela completa** ($ usado/teto por janela; `q` sair · `r` atualizar · `a` ajuste de pico). Adaptativa: ≥118 colunas mostra teto e valores completos; telas estreitas mostram versão resumida |
