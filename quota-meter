@@ -11,7 +11,7 @@
 #             (Windows: pip install windows-curses).
 """quota-meter — medidor de cotas do OpenCode Go."""
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 import argparse
 import datetime as dt
@@ -155,8 +155,30 @@ def official_usage(timeout=8):
                                 "severity": m.get("severity")}
         if metrics:
             metrics["fetched_at"] = e.get("fetched_at")
+            metrics["starts"] = _window_starts(metrics)
             return metrics
     return None
+
+
+def _window_starts(metrics):
+    """Deriva o início das janelas oficiais a partir dos resets (7d e mês/billing)."""
+    starts = {}
+    def _parse(v):
+        return dt.datetime.fromisoformat((v or "").replace("Z", "+00:00"))
+    try:
+        r7 = _parse((metrics.get("7d") or {}).get("reset_at"))
+        starts["7d"] = (r7 - dt.timedelta(days=7)).isoformat()
+    except Exception:
+        pass
+    try:
+        r30 = _parse((metrics.get("30d") or {}).get("reset_at"))
+        y, m = r30.year, r30.month - 1
+        if m == 0:
+            y, m = y - 1, 12
+        starts["30d"] = r30.replace(year=y, month=m).isoformat()
+    except Exception:
+        pass
+    return starts
 
 
 def open_db(db):
@@ -174,8 +196,17 @@ def open_db(db):
     return con
 
 
-def load(db, limits, peak_doubled, short, flat=False):
+def load(db, limits, peak_doubled, short, flat=False, starts=None):
     now_ms = int(time.time() * 1000)
+    bounds = {}
+    for (w, span, _) in WINDOWS:
+        start_ms = None
+        if starts and starts.get(w):
+            try:
+                start_ms = int(dt.datetime.fromisoformat(starts[w]).timestamp() * 1000)
+            except Exception:
+                start_ms = None
+        bounds[w] = start_ms if start_ms is not None else now_ms - span
     agg = {}
     con = open_db(db)
     for (tc, data) in con.execute(
@@ -195,8 +226,8 @@ def load(db, limits, peak_doubled, short, flat=False):
         if not flat and mid in peak_doubled and is_peak(ts):
             cost *= 2
         a = agg.setdefault(mid, {"w": [0.0, 0.0, 0.0], "n": [0, 0, 0]})
-        for i, (_, span, _) in enumerate(WINDOWS):
-            if now_ms - ts <= span:
+        for i, (w, span, _) in enumerate(WINDOWS):
+            if bounds[w] <= ts <= now_ms:
                 a["w"][i] += cost
                 a["n"][i] += 1
 
@@ -369,7 +400,8 @@ def run_tui(db, limits, peak_doubled, short, official_enabled=True):
         def draw():
             stdscr.erase()
             h, w = stdscr.getmaxyx()
-            models, now_ms = load(db, limits, peak_doubled, short, flat=state["flat"])
+            starts = (state.get("official") or {}).get("starts")
+            models, now_ms = load(db, limits, peak_doubled, short, flat=state["flat"], starts=starts)
             hh = dt.datetime.fromtimestamp(now_ms / 1000)
             title = (f" quota-meter {__version__} — OpenCode Go · {hh:%d/%m %H:%M:%S} "
                      f"· pico {'OFF' if state['flat'] else 'ON'} ")
@@ -523,7 +555,8 @@ def main():
 
     def render():
         official = official_usage() if use_official else None
-        models, now_ms = load(db, limits, peak_doubled, short, flat=args.flat)
+        starts = official.get("starts") if official else None
+        models, now_ms = load(db, limits, peak_doubled, short, flat=args.flat, starts=starts)
         if args.tclock:
             return fmt_tclock(models, official, use_color)
         if args.json:

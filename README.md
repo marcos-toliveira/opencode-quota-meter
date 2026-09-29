@@ -81,9 +81,12 @@ args = ["--details"]
 ## Como funciona / privacidade
 
 - Lê **apenas** o banco local do OpenCode (`session_message`), em modo somente-leitura. Nada sai da sua máquina.
+- **Janelas:** 5h é rolante; **7d e 30d seguem os períodos oficiais** (a semana reinicia na data do
+  reset; o mês no ciclo da assinatura), derivados dos resets do `ai-usagebar` quando disponível —
+  sem isso, uma janela rolante **superestima** o consumo. Sem `ai-usagebar`, caem para rolante.
 - Custo **ajustado 2×** para modelos DeepSeek em horário de pico (seg–sex, 01–04h e 06–10h UTC),
-  porque o cliente grava tarifa off-peak fixa; os tetos exibidos seguem as janelas deslizantes
-  do plano (5h = 20%, 7d = 50%, 30d = 100% do limite mensal do modelo).
+  porque o cliente grava tarifa off-peak fixa. A linha **"Oficial" (API)** é a referência; a tabela
+  por modelo é uma estimativa local (costuma ficar ~20–30% abaixo do oficial).
 - Schema interno do OpenCode v2: se uma atualização quebrar a leitura, abra uma issue.
 
 ## Licença
