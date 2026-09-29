@@ -64,6 +64,23 @@ Ajuste para o seu plano/valores vigentes (confira <https://opencode.ai/docs/go>)
 
 Veja também `examples/quota-meter.json`.
 
+## Contas múltiplas (oficiais isolados)
+
+Para rodar mais de uma conta da mesma integração, aponte o medidor para um config alternativo do
+ai-usagebar e isole o cache dele:
+
+```sh
+#!/usr/bin/env bash
+# ex.: ~/.local/bin/quota-meter-2
+export QUOTA_METER_DB="$HOME/.opencode-go2/data/opencode/opencode.db"
+export QUOTA_METER_AUB_CONFIG="$HOME/.config/ai-usagebar/config2.toml"
+export QUOTA_METER_AUB_CACHE_HOME="$HOME/.cache/ai-usagebar-2"
+exec quota-meter "$@"
+```
+
+- `QUOTA_METER_AUB_CONFIG` → repassado como `--config` ao ai-usagebar.
+- `QUOTA_METER_AUB_CACHE_HOME` → vira `XDG_CACHE_HOME` do processo (o `usage` não aceita `--cache-dir`).
+
 ## tclock (widget)
 
 ```toml
