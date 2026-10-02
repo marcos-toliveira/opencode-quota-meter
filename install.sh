@@ -1,18 +1,26 @@
 #!/bin/sh
 # Instala o quota-meter em ~/.local/bin (ou $PREFIX/bin).
+#
+# Esta é a implementação em Rust (zero dependências além da std). O script
+# compila o binário e instala o artefato de `target/release/`. O script Python
+# original (`quota-meter`) é mantido no repo apenas como referência de paridade.
 set -eu
-RAW="https://raw.githubusercontent.com/marcos-toliveira/opencode-quota-meter/main/quota-meter"
-DEST="${PREFIX:-$HOME/.local/bin}"
 DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+DEST="${PREFIX:-$HOME/.local/bin}"
+BIN="$DIR/target/release/quota-meter"
+
+if [ ! -x "$BIN" ]; then
+  echo "Compilando (cargo build --release)..."
+  cargo build --release --manifest-path "$DIR/Cargo.toml"
+fi
+
+if [ ! -x "$BIN" ]; then
+  echo "quota-meter: erro: $BIN não encontrado após a compilação." >&2
+  exit 1
+fi
 
 mkdir -p "$DEST"
-if [ -f "$DIR/quota-meter" ]; then
-  install -m 755 "$DIR/quota-meter" "$DEST/quota-meter"
-else
-  command -v curl >/dev/null 2>&1 || { echo "quota-meter: preciso de curl para baixar o script" >&2; exit 1; }
-  curl -fsSL "$RAW" -o "$DEST/quota-meter"
-  chmod 755 "$DEST/quota-meter"
-fi
+install -m 755 "$BIN" "$DEST/quota-meter"
 
 echo "quota-meter instalado em $DEST/quota-meter"
 case ":$PATH:" in

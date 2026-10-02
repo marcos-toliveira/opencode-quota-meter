@@ -4,10 +4,11 @@ Medidor de cotas do **OpenCode Go** por modelo — janelas rolantes de **5h / 7d
 com ajuste de pico para modelos DeepSeek. Saída para CLI, JSON, TUI e widget do
 [tclock](https://github.com/akitaonrails/clock-tui).
 
-> **English:** single-file, dependency-free Python 3 utility that reads your local OpenCode v2
-> database (read-only) and shows per-model OpenCode Go quota windows (5h/7d/30d), with peak-hour
-> pricing doubled for DeepSeek models. Includes a curses TUI and a compact text mode for status
-> bars/tclock. MIT.
+> **English:** single-file, dependency-free Rust utility (std only, edition 2024) that reads your
+> local OpenCode v2 database (read-only) and shows per-model OpenCode Go quota windows (5h/7d/30d),
+> with peak-hour pricing doubled for DeepSeek models. The interactive TUI uses `stty` + ANSI
+> (no curses), and there is a compact text mode for status bars/tclock. The original Python
+> implementation is kept in the repo as the parity reference. MIT.
 
 ```text
 $ quota-meter
@@ -18,19 +19,23 @@ MiMo 2.6F     5h ░░░░░░░░    0%  7d ░░░░░░░░    
 
 ## Requisitos
 
-- **Python 3.8+**
+- **Rust 1.85+** (edition 2024) para compilar — o utilitário é escrito em **Rust com zero
+  dependências além da std**
+- **sqlite3** no `PATH` (a leitura do banco é feita por subprocesso `sqlite3 -readonly -json`)
 - **OpenCode v2** com dados locais (o medidor lê o `opencode.db`, somente leitura)
-- TUI: `curses` (POSIX). No Windows: `pip install windows-curses` (modos texto/JSON funcionam sem)
+- TUI: requer terminal POSIX (`stty`). Os modos texto/JSON funcionam em qualquer plataforma com `sqlite3`
 
 ## Instalação
 
 ```sh
-# um comando (baixa o script):
-curl -fsSL https://raw.githubusercontent.com/marcos-toliveira/opencode-quota-meter/main/install.sh | sh
-
-# ou, dentro do checkout do repo:
-./install.sh          # instala em ~/.local/bin (use PREFIX=/usr/local ./install.sh p/ outro destino)
+git clone https://github.com/marcos-toliveira/opencode-quota-meter
+cd opencode-quota-meter
+cargo build --release   # binário zero-dependência (só a std)
+./install.sh            # copia target/release/quota-meter para ~/.local/bin
 ```
+
+`install.sh` compila e instala o artefato de `target/release/` (use
+`PREFIX=/usr/local ./install.sh` para outro destino).
 
 ## Uso
 
@@ -105,6 +110,22 @@ args = ["--details"]
   porque o cliente grava tarifa off-peak fixa. A linha **"Oficial" (API)** é a referência; a tabela
   por modelo é uma estimativa local (costuma ficar ~20–30% abaixo do oficial).
 - Schema interno do OpenCode v2: se uma atualização quebrar a leitura, abra uma issue.
+
+## Testes
+
+```bash
+cargo test
+# paridade byte a byte com o Python original (opcional):
+QUOTA_METER_PARITY_PY="$PWD/quota-meter" cargo test --test cli
+```
+
+- **Unitários** (`src/main.rs`): janelas de pico, calendário civil, ISO-8601, `rel_reset`,
+  formatação decimal exata do Python (HALF-EVEN), barra/percentuais e o parser JSON/SQLite.
+- **Integração** (`tests/cli.rs`): constrói um banco SQLite temporário com `sqlite3` e um config
+  isolado, com o relógio congelado por `QUOTA_METER_NOW_MS`; cobre `--line`, `--details`,
+  `--tclock`, `--json`/`--flat`, `--version`, banco ausente ou sem schema e a recusa da TUI em
+  `TERM=dumb`. Com `QUOTA_METER_PARITY_PY` definido, compara as saídas **byte a byte** com o
+  script Python no mesmo banco, config e instante.
 
 ## Licença
 
